@@ -15,7 +15,7 @@ import {
     elizaLogger,
     getEmbeddingZeroVector,
     IImageDescriptionService,
-    ServiceType
+    ServiceType,
 } from "@elizaos/core";
 import { ClientBase } from "./base";
 import { buildConversationThread, sendTweet, wait } from "./utils.ts";
@@ -59,6 +59,9 @@ Here is the current post text again. Remember to include an action if the curren
 {{currentPost}}
 Here is the descriptions of images in the Current post.
 {{imageDescriptions}}
+
+Here is some data about {{twitterPostAuthorUserName}}:
+{{postAuthorAdditionalInfo}}
 ` + messageCompletionFooter;
 
 export const twitterShouldRespondTemplate = (targetUsersStr: string) =>
@@ -94,6 +97,7 @@ Thread of Tweets You Are Replying To:
 ` + shouldRespondFooter;
 
 export class TwitterInteractionClient {
+    checkTimesByUserId: Object;
     client: ClientBase;
     runtime: IAgentRuntime;
     private isDryRun: boolean;
@@ -101,6 +105,7 @@ export class TwitterInteractionClient {
         this.client = client;
         this.runtime = runtime;
         this.isDryRun = this.client.twitterConfig.TWITTER_DRY_RUN;
+        this.checkTimesByUserId = {};
     }
 
     async start() {
@@ -164,20 +169,29 @@ export class TwitterInteractionClient {
                                         this.client.lastCheckedTweetId;
                                 const isRecent =
                                     Date.now() - tweet.timestamp * 1000 <
-                                    2 * 60 * 60 * 1000;
+                                    4 * 60 * 60 * 1000;
+
+                                const twentyFourHoursAgo = new Date(
+                                    new Date().getTime() - 24 * 60 * 60 * 1000
+                                );
+                                const respondedToUserRecently =
+                                    twentyFourHoursAgo <
+                                    this.checkTimesByUserId[tweet.userId];
 
                                 elizaLogger.log(`Tweet ${tweet.id} checks:`, {
                                     isUnprocessed,
                                     isRecent,
                                     isReply: tweet.isReply,
                                     isRetweet: tweet.isRetweet,
+                                    respondedToUserRecently,
                                 });
 
                                 return (
                                     isUnprocessed &&
                                     !tweet.isReply &&
                                     !tweet.isRetweet &&
-                                    isRecent
+                                    isRecent &&
+                                    !respondedToUserRecently
                                 );
                             });
 
@@ -291,6 +305,7 @@ export class TwitterInteractionClient {
 
                     // Update the last checked tweet ID after processing each tweet
                     this.client.lastCheckedTweetId = BigInt(tweet.id);
+                    this.checkTimesByUserId[tweet.userId] = new Date();
                 }
             }
 
@@ -349,8 +364,8 @@ export class TwitterInteractionClient {
         elizaLogger.debug("formattedConversation: ", formattedConversation);
 
         const imageDescriptionsArray = [];
-        try{
-            elizaLogger.debug('Getting images');
+        try {
+            elizaLogger.debug("Getting images");
             for (const photo of tweet.photos) {
                 elizaLogger.debug(photo.url);
                 const description = await this.runtime
@@ -361,21 +376,65 @@ export class TwitterInteractionClient {
                 imageDescriptionsArray.push(description);
             }
         } catch (error) {
-    // Handle the error
-    elizaLogger.error("Error Occured during describing image: ", error);
-}
+            // Handle the error
+            elizaLogger.error("Error Occured during describing image: ", error);
+        }
 
+        const getUserCookieData = async (username) => {
+            const headers = {
+                accept: "application/json",
+                "x-api-key": process.env.COOKIE_API_KEY,
+            };
+            const BASE_URL = "https://api.cookie.fun/v2/agents";
 
+            console.log(
+                "\x1b[38;5;214m%s\x1b[0m",
+                `Gettings cookie agent data for ${username}`
+            );
+            const options = {
+                method: "GET",
+                headers: headers,
+            };
 
+            try {
+                const res = await fetch(
+                    `${BASE_URL}/twitterUsername/${username}?interval=_7Days`,
+                    options
+                );
+                if (!res.ok) {
+                    throw new Error(res.statusText);
+                }
+
+                const data = await res.json();
+
+                console.log(data.ok);
+                return JSON.stringify({ ...data.ok, delta_time: "7 days" });
+            } catch (err) {
+                console.log("\x1b[38;5;214m%s\x1b[0m", err);
+                return;
+            }
+        };
+
+        const postAuthorAdditionalInfo = await getUserCookieData(
+            tweet.username
+        );
 
         let state = await this.runtime.composeState(message, {
             twitterClient: this.client.twitterClient,
             twitterUserName: this.client.twitterConfig.TWITTER_USERNAME,
+            twitterPostAuthorUserName: tweet.username,
+            postAuthorAdditionalInfo: postAuthorAdditionalInfo,
             currentPost,
             formattedConversation,
-            imageDescriptions: imageDescriptionsArray.length > 0
-            ? `\nImages in Tweet:\n${imageDescriptionsArray.map((desc, i) =>
-              `Image ${i + 1}: Title: ${desc.title}\nDescription: ${desc.description}`).join("\n\n")}`:""
+            imageDescriptions:
+                imageDescriptionsArray.length > 0
+                    ? `\nImages in Tweet:\n${imageDescriptionsArray
+                          .map(
+                              (desc, i) =>
+                                  `Image ${i + 1}: Title: ${desc.title}\nDescription: ${desc.description}`
+                          )
+                          .join("\n\n")}`
+                    : "",
         });
 
         // check if the tweet exists, save if it doesn't
